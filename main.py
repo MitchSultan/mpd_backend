@@ -7,18 +7,29 @@ Handles hydraulic calculations and persists all results to Supabase.
 
 """
 
+import importlib
 import os
 import math
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Any, Optional, TYPE_CHECKING
 from contextlib import asynccontextmanager
 
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from supabase import create_client, Client
 from dotenv import load_dotenv
+
+if TYPE_CHECKING:
+    from supabase import Client  # type: ignore
+
+try:
+    _supabase = importlib.import_module("supabase")
+    create_client = _supabase.create_client
+    Client = _supabase.Client
+except ImportError:
+    create_client = None  # type: ignore
+    Client = Any  # type: ignore
 
 load_dotenv()
 
@@ -28,7 +39,7 @@ load_dotenv()
 
 SUPABASE_URL = os.environ["NEXT_PUBLIC_SUPABASE_URL"]
 SUPABASE_KEY = os.environ["NEXT_PUBLIC_SUPABASE_SERVICE_KEY"]
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+supabase: Any = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------------------------------------------------------------------
 # App
