@@ -5,3 +5,4 @@ pandas
 scipy
 pydantic
 python-dotenv
+supabase
