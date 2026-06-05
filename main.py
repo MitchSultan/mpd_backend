@@ -1,11 +1,4 @@
-"""
-MPD Analytics Suite — FastAPI backend (Railway)
-Handles hydraulic calculations and persists all results to Supabase.
 
-
-
-
-"""
 
 import importlib
 import os
