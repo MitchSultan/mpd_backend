@@ -35,7 +35,7 @@ SUPABASE_KEY = os.environ["NEXT_PUBLIC_SUPABASE_SERVICE_KEY"]
 supabase: Any = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 # ---------------------------------------------------------------------------
-# App
+# App true
 # ---------------------------------------------------------------------------
 
 @asynccontextmanager
