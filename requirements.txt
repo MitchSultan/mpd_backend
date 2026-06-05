@@ -4,3 +4,4 @@ numpy
 pandas
 scipy
 pydantic
+python-dotenv
