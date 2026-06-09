@@ -8,7 +8,10 @@ from typing import Any, Optional, TYPE_CHECKING
 from contextlib import asynccontextmanager
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from scipy.optimize import fsolve
+import random
+import asyncio
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -62,6 +65,25 @@ app.add_middleware(
 # Pydantic models
 # ---------------------------------------------------------------------------
 
+class FormationLayer(BaseModel):
+    top_depth_ft: float
+    bottom_depth_ft: float
+    pore_pressure_ppg: float
+    fracture_gradient_ppg: float
+    lithology: Optional[str] = None
+    geothermal_gradient: Optional[float] = None
+
+class FormationDataInput(BaseModel):
+    layers: list[FormationLayer]
+
+class RealtimeSimulatorInput(BaseModel):
+    flow_rate_gpm: float = 600
+    mud_weight_ppg: float = 11.5
+    bit_depth_ft: float = 12500
+    duration_sec: int = 60
+    interval_sec: int = 3
+    simulation_type: str = "circulation"
+
 class SimulationInput(BaseModel):
     well_id: str
     fluid_id: Optional[str] = None
@@ -112,10 +134,6 @@ def calculate_bhp(
     depth_ft: float,
     surface_backpressure_psi: float = 0.0,
 ) -> float:
-    """
-    BHP = (mud_weight × 0.052 × depth) + surface_backpressure
-    0.052 is the conversion factor: ppg × ft → psi
-    """
     hydrostatic = mud_weight_ppg * 0.052 * depth_ft
     return hydrostatic + surface_backpressure_psi
 
@@ -129,49 +147,74 @@ def calculate_annular_friction_pressure(
     pipe_od_in: float,
     depth_ft: float,
 ) -> float:
-    """
-    Bingham Plastic model — annular friction pressure loss (psi).
-    Using API RP 13D simplified approach.
-    """
+    if flow_rate_gpm <= 0:
+        return 0.0
     annular_gap = hole_od_in - pipe_od_in
-    # Annular velocity (ft/min)
     annular_area_in2 = math.pi / 4 * (hole_od_in**2 - pipe_od_in**2)
     annular_area_ft2 = annular_area_in2 / 144
-    velocity_ftmin = flow_rate_gpm * 0.3208 / annular_area_ft2
+    velocity_ftmin = flow_rate_gpm * 0.3208 / max(annular_area_ft2, 0.01)
 
-    # Equivalent diameter
-    de = hole_od_in - pipe_od_in  # simplified
+    de = hole_od_in - pipe_od_in
+    re_bingham = 109 * mud_weight_ppg * velocity_ftmin * de / max(plastic_viscosity_cp, 1)
 
-    # Bingham Reynolds number
-    re = 109 * mud_weight_ppg * velocity_ftmin * de / plastic_viscosity_cp
-    re_bingham = re  # simplified; full model uses Hedstrom number
-
-    # Friction factor (Dodge-Metzner for Bingham)
     if re_bingham < 2100:
         f = 24 / re_bingham if re_bingham > 0 else 0
     else:
         f = 0.0791 / (re_bingham**0.25)
 
-    # Friction pressure loss (psi)
     velocity_fts = velocity_ftmin / 60
-    density_ppg = mud_weight_ppg
-    friction_psi = (f * depth_ft * density_ppg * velocity_fts**2) / (
-        25.81 * de
-    )
+    friction_psi = (f * depth_ft * mud_weight_ppg * velocity_fts**2) / (25.81 * max(de, 0.1))
     return max(friction_psi, 0.0)
 
 
+def calculate_swab_surge_pressure(
+    velocity_ftmin: float,
+    mud_weight_ppg: float,
+    plastic_viscosity_cp: float,
+    yield_point_lbf: float,
+    hole_od_in: float,
+    pipe_od_in: float,
+    depth_ft: float,
+) -> float:
+    """Positive velocity is surge (running in), negative is swab (pulling out)."""
+    if velocity_ftmin == 0:
+        return 0.0
+    
+    pipe_area = math.pi / 4 * pipe_od_in**2
+    annular_area = math.pi / 4 * (hole_od_in**2 - pipe_od_in**2)
+    vm = velocity_ftmin * (pipe_area / max(annular_area, 0.1) + 1)
+    
+    de = hole_od_in - pipe_od_in
+    re_bingham = 109 * mud_weight_ppg * abs(vm) * de / max(plastic_viscosity_cp, 1)
+    
+    if re_bingham < 2100:
+        f = 24 / re_bingham if re_bingham > 0 else 0
+    else:
+        f = 0.0791 / (re_bingham**0.25)
+        
+    vm_fts = abs(vm) / 60
+    pressure_loss = (f * depth_ft * mud_weight_ppg * vm_fts**2) / (25.81 * max(de, 0.1))
+    return pressure_loss if velocity_ftmin > 0 else -pressure_loss
+
+
+def calculate_ecd_equation(ecd_guess, mud_density, pressure_loss, depth):
+    return ecd_guess - mud_density - (pressure_loss / (0.052 * max(depth, 1)))
+
+
 def calculate_ecd(
-    bhp_psi: float,
+    mud_weight_ppg: float,
     friction_loss_psi: float,
     depth_ft: float,
 ) -> float:
-    """
-    ECD (ppg) = (BHP + annular friction) / (0.052 × depth)
-    """
     if depth_ft <= 0:
-        return 0.0
-    return (bhp_psi + friction_loss_psi) / (0.052 * depth_ft)
+        return mud_weight_ppg
+    if friction_loss_psi == 0:
+        return mud_weight_ppg
+    
+    ecd_initial_guess = mud_weight_ppg + 0.5
+    ecd_solution = fsolve(calculate_ecd_equation, ecd_initial_guess, args=(mud_weight_ppg, friction_loss_psi, depth_ft))
+    return float(ecd_solution[0])
+
 
 
 def calculate_choke_pressure(
@@ -242,25 +285,50 @@ def run_simulation(payload: SimulationInput):
     Run hydraulic calculations and persist result to hydraulic_simulations.
     Returns the saved row including computed outputs.
     """
-    # --- calculations ---
-    bhp = calculate_bhp(payload.mud_weight_ppg, payload.bit_depth_ft)
+    # Define pipe movement for tripping
+    pipe_velocity_ftmin = 0.0
+    if payload.simulation_type == "tripping_in":
+        pipe_velocity_ftmin = 60.0
+    elif payload.simulation_type == "tripping_out":
+        pipe_velocity_ftmin = -60.0
 
-    friction = calculate_annular_friction_pressure(
-        flow_rate_gpm=payload.flow_rate_gpm,
-        mud_weight_ppg=payload.mud_weight_ppg,
-        plastic_viscosity_cp=payload.plastic_viscosity_cp,
-        yield_point_lbf=payload.yield_point_lbf100ft2,
-        hole_od_in=payload.hole_size_in,
-        pipe_od_in=payload.drill_pipe_od_in,
-        depth_ft=payload.bit_depth_ft,
-    )
+    # Friction and swab/surge calculations
+    friction = 0.0
+    surge_swab = 0.0
 
-    ecd = calculate_ecd(bhp, friction, payload.bit_depth_ft)
+    if payload.simulation_type in ["circulation", "dynamic", "static"]:
+        friction = calculate_annular_friction_pressure(
+            flow_rate_gpm=payload.flow_rate_gpm,
+            mud_weight_ppg=payload.mud_weight_ppg,
+            plastic_viscosity_cp=payload.plastic_viscosity_cp,
+            yield_point_lbf=payload.yield_point_lbf100ft2,
+            hole_od_in=payload.hole_size_in,
+            pipe_od_in=payload.drill_pipe_od_in,
+            depth_ft=payload.bit_depth_ft,
+        )
+    elif payload.simulation_type in ["tripping_in", "tripping_out", "tripping"]:
+        surge_swab = calculate_swab_surge_pressure(
+            velocity_ftmin=pipe_velocity_ftmin,
+            mud_weight_ppg=payload.mud_weight_ppg,
+            plastic_viscosity_cp=payload.plastic_viscosity_cp,
+            yield_point_lbf=payload.yield_point_lbf100ft2,
+            hole_od_in=payload.hole_size_in,
+            pipe_od_in=payload.drill_pipe_od_in,
+            depth_ft=payload.bit_depth_ft,
+        )
+
+    total_pressure_loss = friction + surge_swab
+
+    choke_applied = 0.0
+    
+    bhp = calculate_bhp(payload.mud_weight_ppg, payload.bit_depth_ft, surface_backpressure_psi=choke_applied) + surge_swab
+    
+    ecd = calculate_ecd(payload.mud_weight_ppg, total_pressure_loss, payload.bit_depth_ft)
 
     # Annular velocity (ft/min)
     ann_area_in2 = math.pi / 4 * (payload.hole_size_in**2 - payload.drill_pipe_od_in**2)
     ann_area_ft2 = ann_area_in2 / 144
-    ann_velocity = payload.flow_rate_gpm * 0.3208 / ann_area_ft2
+    ann_velocity = payload.flow_rate_gpm * 0.3208 / max(ann_area_ft2, 0.01)
 
     # Estimated bottom temperature (geothermal gradient ~1.5°F/100ft if not provided)
     bottom_temp = payload.bottom_temperature_f or (
@@ -368,7 +436,7 @@ def get_latest_monitoring(well_id: str):
         .execute()
     )
     if not res.data:
-        raise HTTPException(status_code=404, detail="No monitoring data found")
+        return None
     return res.data[0]
 
 
@@ -427,3 +495,75 @@ def list_simulations(well_id: str, limit: int = 20):
         .execute()
     )
     return res.data
+
+
+@app.post("/wells/{well_id}/formation")
+def save_formation_data(well_id: str, payload: FormationDataInput):
+    # clear existing data
+    supabase.table("formation_data").delete().eq("well_id", well_id).execute()
+    
+    rows = []
+    for layer in payload.layers:
+        rows.append({
+            "well_id": well_id,
+            "depth_ft": layer.bottom_depth_ft,
+            "pore_pressure_ppg": layer.pore_pressure_ppg,
+            "fracture_gradient_ppg": layer.fracture_gradient_ppg,
+            "lithology": layer.lithology
+        })
+    if rows:
+        supabase.table("formation_data").insert(rows).execute()
+    return {"status": "success", "inserted": len(rows)}
+
+@app.get("/wells/{well_id}/formation")
+def get_formation_data(well_id: str):
+    res = supabase.table("formation_data").select("*").eq("well_id", well_id).order("depth_ft").execute()
+    return res.data
+
+@app.post("/wells/{well_id}/simulate-realtime")
+def simulate_realtime(well_id: str, payload: RealtimeSimulatorInput, background_tasks: BackgroundTasks):
+    def run_simulation_task():
+        # Generate some quick data points right now to simulate history
+        num_points = payload.duration_sec // payload.interval_sec
+        rows = []
+        
+        for i in range(num_points):
+            time_offset = (num_points - i) * payload.interval_sec
+            
+            # Add some noise
+            flow = payload.flow_rate_gpm + random.uniform(-10, 10)
+            choke = 450 + random.uniform(-5, 5)
+            
+            # Simple simulation logic inline
+            hydrostatic = payload.mud_weight_ppg * 0.052 * payload.bit_depth_ft
+            friction = calculate_annular_friction_pressure(
+                flow_rate_gpm=flow,
+                mud_weight_ppg=payload.mud_weight_ppg,
+                plastic_viscosity_cp=15.0,
+                yield_point_lbf=10.0,
+                hole_od_in=8.5,
+                pipe_od_in=5.0,
+                depth_ft=payload.bit_depth_ft
+            )
+            bhp = hydrostatic + choke + friction
+            ecd = calculate_ecd(payload.mud_weight_ppg, friction, payload.bit_depth_ft)
+            
+            rows.append({
+                "well_id": well_id,
+                "pump_rate_gpm": flow,
+                "standpipe_pressure_psi": bhp - choke + friction, # SPP approx
+                "choke_opening_pct": 30.0,
+                "surface_backpressure_psi": choke,
+                "bhp_psi": bhp,
+                "ecd_ppg": ecd,
+                "mud_weight_ppg": payload.mud_weight_ppg,
+                "flow_rate_in_gpm": flow,
+                "flow_rate_out_gpm": flow,
+                "alert_status": "normal"
+            })
+            
+        if rows:
+            supabase.table("realtime_monitoring").insert(rows).execute()
+
+    background_tasks.add_task(run_simulation_task)
+    return {"status": "Simulator started"}
